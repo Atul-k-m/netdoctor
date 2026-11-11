@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
@@ -55,8 +57,14 @@ def diagnose(
     quick: bool = typer.Option(False, "--quick", help="Fewer probes: 5 pings, 3 MTR rounds, no port scan."),
     json_out: str | None = typer.Option(None, "--json", help="Write all evidence as JSON to this file ('-' = stdout)."),
     brief: bool = typer.Option(False, "--brief", help="Only print the summary table."),
+    no_capture: bool = typer.Option(False, "--no-capture", help="Don't capture packets during the run."),
+    capture_tool: str = typer.Option("auto", "--capture-tool",
+                                     help="auto | dumpcap | pktmon (Windows) | tcpdump (Linux)."),
+    out: Path | None = typer.Option(None, "--out", help="Run folder for capture.pcap (default runs/<time>-<host>)."),
 ) -> None:
-    """Diagnose a URL or host bottom-up: local, DNS, ICMP, path, TCP, path MTU, TLS, HTTP."""
+    """Diagnose a URL or host bottom-up: local, DNS, ICMP, path, TCP, path MTU, TLS, HTTP.
+
+    Packets are captured during the run (needs admin/root; see --no-capture)."""
     from .render import render_header, render_result, render_summary
     from .runner import run_diagnosis
 
@@ -64,6 +72,9 @@ def diagnose(
         tgt = parse_target(target, port)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="TARGET") from exc
+    if capture_tool not in ("auto", "dumpcap", "pktmon", "tcpdump"):
+        raise typer.BadParameter("choose auto, dumpcap, pktmon or tcpdump", param_hint="--capture-tool")
+    run_dir = out or default_run_dir(tgt.host)
 
     opts = Options(
         count=5 if quick else count,
@@ -76,6 +87,9 @@ def diagnose(
         no_proxy=no_proxy,
         only=_ids(only, "--only"),
         skip=_ids(skip, "--skip") or set(),
+        capture=not no_capture,
+        capture_tool=capture_tool,
+        out_dir=run_dir,
     )
     to_stdout = json_out == "-"
     console = Console(stderr=to_stdout, highlight=False)
@@ -97,8 +111,16 @@ def diagnose(
         if not quiet and not brief:
             render_result(console, result)
 
+    def on_capture(session, error) -> None:
+        if quiet:
+            return
+        if session is not None:
+            console.print(f"[dim]Capturing packets with {session.tool} on {session.interface} -> {session.path}[/]")
+        else:
+            console.print(f"[yellow]Packet capture off:[/] {error}")
+
     try:
-        diag = run_diagnosis(tgt, opts, on_start, on_done)
+        diag = run_diagnosis(tgt, opts, on_start, on_done, on_capture)
     finally:
         if status_line:
             status_line.stop()
@@ -115,6 +137,36 @@ def diagnose(
             out.write_text(payload, encoding="utf-8")
             console.print(f"[dim]Evidence written to {json_out}[/]")
     raise typer.Exit(1 if diag.status == Status.FAIL else 0)
+
+
+def default_run_dir(host: str) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9.-]+", "_", host)[:60]
+    return Path("runs") / f"{stamp}-{safe}"
+
+
+@app.command()
+def pcap(
+    file: Path = typer.Argument(..., exists=True, dir_okay=False, help="A .pcap or .pcapng file (any source)."),
+    focus: list[str] = typer.Option([], "--focus", "-f", help="Judge only flows to this server ip:port (repeatable)."),
+    json_out: bool = typer.Option(False, "--json", help="Print the raw summary as JSON."),
+) -> None:
+    """Summarize a capture: handshakes, retransmissions, RSTs, zero windows, TLS alerts, DNS errors, ICMP."""
+    from .capture import build_result, summarize_file
+    from .render import render_result
+
+    targets = []
+    for item in focus:
+        host, _, port = item.rpartition(":")
+        if not host or not port.isdigit():
+            raise typer.BadParameter(f"expected ip:port, got {item!r}", param_hint="--focus")
+        targets.append((host.strip("[]"), int(port)))
+    summary = summarize_file(file, targets)
+    if json_out:
+        sys.stdout.write(json.dumps(summary, indent=2, default=str) + "\n")
+        return
+    render_result(Console(highlight=False), build_result(summary, {"file": str(file), "tool": "file"}),
+                  show_commands=False)
 
 
 @app.command()

@@ -9,6 +9,7 @@ import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -84,20 +85,121 @@ def _prerequisite(ctx: RunContext, check_id: str) -> None:
         pass
 
 
+def _resolve_quick(host: str, timeout: float = 3.0) -> list[str]:
+    res, _err, _to = call_with_timeout(socket.getaddrinfo, timeout, host, None, 0, socket.SOCK_STREAM)
+    return list(dict.fromkeys(ai[4][0] for ai in res or []))
+
+
+def capture_hosts(ctx: RunContext) -> list[str]:
+    """IPs for the capture filter, known before DNS runs: the target (pre-resolved,
+    falling back to 8.8.8.8 when the local resolver is broken), the public resolvers
+    the DNS check asks, and the proxy."""
+    t = ctx.target
+    ips = [t.host] if t.is_ip else _resolve_quick(t.host)
+    if not ips and not t.is_ip:
+        try:
+            import dns.message
+            import dns.query
+            import dns.rdatatype
+
+            resp = dns.query.udp(dns.message.make_query(t.host, dns.rdatatype.A), "8.8.8.8", timeout=2.0)
+            ips = [r.address for rrset in resp.answer if rrset.rdtype == dns.rdatatype.A for r in rrset]
+        except Exception:  # noqa: BLE001 - best effort
+            ips = []
+    ips += ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
+    if ctx.proxy and ctx.proxy.host_port:
+        ips += _resolve_quick(ctx.proxy.host_port[0])
+    return list(dict.fromkeys(ips))
+
+
+def capture_focus(ctx: RunContext) -> list[tuple[str, int]]:
+    """Server endpoints whose flows the capture summary should judge."""
+    port = ctx.target.port
+    focus = [(ip, port) for ip in dict.fromkeys([ctx.ip, *ctx.addresses]) if ip]
+    if ctx.proxy and ctx.proxy.host_port:
+        phost, pport = ctx.proxy.host_port
+        focus += [(ip, pport) for ip in _resolve_quick(phost)]
+    return focus
+
+
+def _start_capture(ctx: RunContext, on_capture: Callable | None) -> tuple[Any, str | None]:
+    from .capture import CaptureUnavailable, start_capture
+
+    out = ctx.opts.out_dir or Path("runs")
+    try:
+        hosts = capture_hosts(ctx)
+        # hosts[0] is the target (or 8.8.8.8 if it did not resolve): its route picks the interface.
+        session = start_capture(out / "capture.pcap", hosts, ctx.opts.capture_tool, hosts[0] if hosts else None)
+    except CaptureUnavailable as exc:
+        if on_capture:
+            on_capture(None, str(exc))
+        return None, str(exc)
+    except Exception as exc:  # noqa: BLE001 - capture must never break the diagnosis
+        if on_capture:
+            on_capture(None, repr(exc))
+        return None, repr(exc)
+    if on_capture:
+        on_capture(session, None)
+    return session, None
+
+
+def _finish_capture(ctx: RunContext, session: Any, error: str | None) -> CheckResult:
+    from .capture import build_result, summarize_file, unavailable
+
+    if session is None:
+        return unavailable(error or "not started")
+    started = time.perf_counter()
+    info = session.stop()
+    try:
+        summary = summarize_file(session.path, capture_focus(ctx))
+    except Exception as exc:  # noqa: BLE001
+        res = unavailable(f"capture saved to {session.path} but could not be analyzed: {exc!r}")
+        res.data["traceback"] = traceback.format_exc()
+        return res
+    res = build_result(summary, info)
+    res.duration_ms = (time.perf_counter() - started) * 1000.0
+    return res
+
+
 def run_diagnosis(
     target: Target,
     opts: Options,
     on_start: Callable[[ModuleType], None] | None = None,
     on_done: Callable[[CheckResult], None] | None = None,
+    on_capture: Callable[[Any, str | None], None] | None = None,
 ) -> Diagnosis:
     ctx = RunContext(target, opts)
     diag = Diagnosis(target, opts, started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     diag.environment = environment(ctx)
     t0 = time.perf_counter()
+    holder: dict[str, Any] = {}
+    try:
+        _run_checks(ctx, diag, on_start, on_done, on_capture, holder)
+    finally:
+        # Always stop the capture tool, even if the run is interrupted.
+        if opts.capture:
+            result = _finish_capture(ctx, holder.get("session"), holder.get("error"))
+            ctx.results[result.id] = result
+            diag.results.append(result)
+            if on_done:
+                on_done(result)
+    diag.duration_s = round(time.perf_counter() - t0, 1)
+    diag.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    diag.environment["target_ip"] = ctx.ip
+    diag.environment["target_ip_source"] = ctx.ip_source
+    diag.environment["proxy"] = ctx.proxy.to_dict() if ctx.proxy else None
+    diag.environment["egress"] = ctx.egress
+    return diag
+
+
+def _run_checks(ctx: RunContext, diag: Diagnosis, on_start, on_done, on_capture, holder: dict) -> None:
+    opts = ctx.opts
     for module in CHECKS:
         selected = (opts.only is None or module.ID in opts.only) and module.ID not in opts.skip
         if not selected:
             _prerequisite(ctx, module.ID)
+            if module.ID == "local" and opts.capture:
+                holder["session"], holder["error"] = _start_capture(ctx, on_capture)
             continue
         if on_start:
             on_start(module)
@@ -114,10 +216,5 @@ def run_diagnosis(
         diag.results.append(result)
         if on_done:
             on_done(result)
-    diag.duration_s = round(time.perf_counter() - t0, 1)
-    diag.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    diag.environment["target_ip"] = ctx.ip
-    diag.environment["target_ip_source"] = ctx.ip_source
-    diag.environment["proxy"] = ctx.proxy.to_dict() if ctx.proxy else None
-    diag.environment["egress"] = ctx.egress
-    return diag
+        if module.ID == "local" and opts.capture:
+            holder["session"], holder["error"] = _start_capture(ctx, on_capture)

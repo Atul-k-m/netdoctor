@@ -17,7 +17,8 @@ All addresses in the examples come from the documentation ranges (192.0.2.0/24, 
 9. [TLS](#9-tls)
 10. [HTTP and proxies](#10-http-and-proxies)
 11. [IPsec and IKE](#11-ipsec-and-ike)
-12. [Cheat sheet](#12-cheat-sheet)
+12. [Packet capture and the capture summary](#12-packet-capture-and-the-capture-summary)
+13. [Cheat sheet](#13-cheat-sheet)
 
 ---
 
@@ -984,7 +985,60 @@ Wireshark: `isakmp`, `isakmp.exchtype == 34`, `esp`, `udp.port == 4500`.
 
 ---
 
-## 12. Cheat sheet
+## 12. Packet capture and the capture summary
+
+The checks tell you what failed. A capture shows what happened on the wire, which is what engineering asks for when they escalate a ticket. `netdoctor diagnose` captures packets during the run, saves them as `capture.pcap` in the run folder (`runs/<time>-<host>/`), and summarizes the file in pure Python. You can open the same file in Wireshark. `netdoctor pcap FILE` summarizes any capture, including one a customer sends you.
+
+### How the capture is taken
+
+| OS | Tool | Notes |
+|----|------|-------|
+| Windows | **dumpcap** (Wireshark's capture engine, through Npcap) | Found on PATH, through `NETDOCTOR_DUMPCAP`, or in the Wireshark install folder. NetDoctor picks the Npcap device whose friendly name matches the interface that routes to the target, or the Npcap loopback adapter for 127.0.0.1. |
+| Windows | **pktmon** (built into Windows 10 2004 and later) | Fallback when dumpcap is missing or blocked. It captures at the NIC component to an ETL file, which `pktmon pcapng` converts. NetDoctor then rewrites the result as plain pcap and removes the filters it added. |
+| Linux | **tcpdump** `-i any -U` | Needs root or CAP_NET_RAW. `-i any` writes Linux "cooked" headers (SLL or SLL2) instead of Ethernet, and the reader handles both. |
+
+**Permissions.** Capturing needs administrator or root rights almost everywhere. On Windows, Npcap can also be installed with *Restrict Npcap driver's access to Administrators only* (registry `HKLM\SYSTEM\CurrentControlSet\Services\npcap\Parameters\AdminOnly = 1`). NetDoctor checks the token (`IsUserAnAdmin`) and that setting before it starts anything. If it can't capture, the capture appears in the report as SKIP with the reason, and every check still runs.
+
+**Never hang.** Each tool gets 12 seconds to report that it is capturing ("Capturing on…" or "listening on…", or a pcap header in the file). If it doesn't, NetDoctor stops it and moves on. This matters on machines where an antivirus holds new executables for a cloud scan.
+
+**Clean stop.** dumpcap is started in its own process group and stopped with Ctrl+Break (`CTRL_BREAK_EVENT`), and tcpdump with SIGINT. Both then flush and close the file. A hard kill can leave a half-written last record, and the reader tolerates that and says so.
+
+**Capture filter.** The filter is in BPF syntax, built before the DNS check runs: `icmp or icmp6 or port 53 or host <target IPs> or host 8.8.8.8 or host 8.8.4.4 or host 1.1.1.1 or host <proxy>`. NetDoctor resolves the target once in advance to fill it in, and falls back to asking 8.8.8.8 directly when the local resolver is the problem. All ICMP is included because the interesting messages, time-exceeded and frag-needed, come from routers whose addresses aren't known in advance.
+
+### File formats
+
+- **pcap:** a 24-byte global header, then a 16-byte record header and the packet bytes for each packet. The magic number `a1b2c3d4` or `a1b23c4d`, in either byte order, gives the endianness and whether timestamps are in microseconds or nanoseconds. The link type is in the global header.
+- **pcapng:** a sequence of blocks. Each Section Header Block sets the byte order. Each Interface Description Block gives an interface's link type and timestamp resolution (`if_tsresol`, a power of 10 or 2). Enhanced Packet Blocks carry the packets. pktmon and Wireshark write pcapng by default.
+
+The decoder handles Ethernet (including 802.1Q/QinQ tags), Linux SLL and SLL2, raw IP and BSD/Npcap loopback framing. It uses the IPv4 total length to strip Ethernet padding, because padding bytes are not TCP payload.
+
+### What the summary computes
+
+| Item | How | Wireshark equivalent |
+|------|-----|----------------------|
+| Handshake | SYN, SYN/ACK, then the client's ACK of ISN+1. RTT = SYN to SYN/ACK. MSS and window scale come from the SYN options. | `tcp.flags.syn == 1`, `tcp.analysis.initial_rtt` |
+| Refused | RST in answer to a SYN | `tcp.flags.reset == 1` |
+| Unanswered SYN | SYN, maybe retransmitted, with no SYN/ACK and no RST: filtered | `tcp.flags.syn == 1 && tcp.analysis.retransmission` |
+| Retransmission | Every byte range seen is recorded per direction. A segment whose range was **already fully seen** is a retransmission. Keep-alives (0–1 byte at next-expected−1) are excluded. | `tcp.analysis.retransmission` |
+| Out-of-order | Below the highest sequence seen but **filling a gap**: new data arriving late, not a resend | `tcp.analysis.out_of_order` |
+| Duplicate ACK | A pure ACK repeating the previous ACK number and window while data is outstanding | `tcp.analysis.duplicate_ack` |
+| Zero window | Window field 0 on a segment without SYN, FIN or RST: the receiver's buffer is full | `tcp.analysis.zero_window` |
+| RST after the handshake | Reported with the side that sent it. Server-side resets point at an application abort, a load-balancer idle timeout or an IPS. | `tcp.flags.reset == 1` |
+| TLS | Each direction is reassembled from its sequence numbers, the first 128 KB of it, so records split across segments still parse. NetDoctor reads ClientHello (SNI, ALPN, supported_versions), ServerHello (version, cipher, ALPN), the TLS 1.2 Certificate message (certificate count) and plaintext alerts (level, description, and which side sent them). | `tls.handshake.type == 1`, `tls.alert_message` |
+| Stalled TLS | ClientHello with no ServerHello and no RST: the server's large handshake packets never arrived, the classic MTU black-hole signature | No single display filter can say "a stream without a ServerHello". Filter `tls.handshake.type == 1`, then Follow → TCP Stream on each match and check for a ServerHello. |
+| Proxy / HTTP | If the stream starts with `CONNECT`, NetDoctor records the proxy's status line and its Proxy-Authenticate, Via and X-Squid-Error headers. For plaintext HTTP it records the request line, Host, status and Location. | `http.request.method == "CONNECT"`, `http.response.code == 407` |
+| DNS | Queries are matched to responses on (client, port, server, ID). NetDoctor reports error RCODEs, queries left unanswered more than 2 s before the capture ended, and response times. | `dns.flags.rcode != 0`, `dns.flags.response == 0 && !dns.response_in` |
+| ICMP | Time-exceeded per router, frag-needed with the next-hop MTU and the destination it refers to (taken from the embedded original header), destination-unreachable codes, and echo requests vs replies | `icmp.type == 3 && icmp.code == 4` |
+
+**Focus.** A NetDoctor run deliberately creates "bad" traffic: the port scan produces refused and unanswered SYNs, and the TLS check closes connections abruptly. The findings therefore judge only flows to the target (and to the proxy), and count the rest separately. RSTs that the client sends after a handshake are labeled as NetDoctor's own aborts. Closing a socket that still has unread data, such as TLS 1.3 session tickets, makes the OS send RST instead of FIN.
+
+**What a capture can't show.** TLS 1.3 encrypts everything after the ServerHello, including the certificate and any alert the client sends when it rejects that certificate. Those alerts show up as application-data records. That is why the TLS check, not the capture, is the source of truth for certificate problems. In TLS 1.2 the client's alert, for example `certificate_expired` (45) or `unknown_ca` (48), is sent before ChangeCipherSpec and is readable on the wire.
+
+**Checked against Wireshark.** `tests/test_tshark_crosscheck.py` builds captures containing a retransmission with duplicate ACKs, zero windows, a server RST, a refused SYN, a TLS 1.2 fatal alert, a DNS NXDOMAIN and an ICMP frag-needed. The test asserts that tshark's analysis flags (`tcp.analysis.*`, `tls.alert_message`, `dns.flags.rcode`) give the same counts as NetDoctor's. It runs wherever tshark is on PATH, or when `NETDOCTOR_TSHARK` is set.
+
+---
+
+## 13. Cheat sheet
 
 | Symptom | Most likely layer | First test | Typical root cause |
 |---------|-------------------|------------|--------------------|

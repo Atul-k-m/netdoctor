@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .icmp import Prober, get_prober
@@ -52,6 +53,9 @@ class Options:
     only: set[str] | None = None
     skip: set[str] = field(default_factory=set)
     captive_probes: list[tuple[str, int, str | None]] = field(default_factory=captive_probes_from_env)
+    capture: bool = False  # the CLI turns it on by default; library callers opt in
+    capture_tool: str = "auto"
+    out_dir: Path | None = None  # run folder for capture.pcap (and reports)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,6 +69,9 @@ class Options:
             "no_proxy": self.no_proxy,
             "only": sorted(self.only) if self.only else None,
             "skip": sorted(self.skip),
+            "capture": self.capture,
+            "capture_tool": self.capture_tool,
+            "out_dir": str(self.out_dir) if self.out_dir else None,
         }
 
 
