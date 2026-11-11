@@ -1,0 +1,14 @@
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+# run artifacts (reports and captures are written here by default)
+runs/
+*.pcap
+*.pcapng
+!docs/**/*.pcap

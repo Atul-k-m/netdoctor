@@ -1,0 +1,123 @@
+"""Command-line interface."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import typer
+from rich.console import Console
+
+from . import __version__
+from .checks import CHECK_IDS
+from .context import Options
+from .models import Status
+from .target import parse_target
+
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="NetDoctor: test a failing URL or host layer by layer, find the root cause, write the ticket notes.",
+)
+
+
+def _ids(value: str | None, option: str) -> set[str] | None:
+    if not value:
+        return None
+    ids = {v.strip().lower() for v in value.split(",") if v.strip()}
+    unknown = ids - set(CHECK_IDS)
+    if unknown:
+        raise typer.BadParameter(f"unknown check(s) {', '.join(sorted(unknown))}; choose from {', '.join(CHECK_IDS)}",
+                                 param_hint=option)
+    return ids
+
+
+@app.callback()
+def main() -> None:
+    """NetDoctor network troubleshooting toolkit."""
+
+
+@app.command()
+def diagnose(
+    target: str = typer.Argument(..., help="URL, host, host:port or IP, e.g. https://example.com/login"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Port to test (overrides the URL)."),
+    count: int = typer.Option(20, "--count", "-c", min=1, max=500, help="ICMP echo requests for the ping check."),
+    max_hops: int = typer.Option(30, "--max-hops", min=1, max=64, help="Traceroute TTL limit."),
+    rounds: int = typer.Option(10, "--rounds", min=0, max=100, help="MTR rounds per hop after the first trace."),
+    probe_timeout: float = typer.Option(1.5, "--probe-timeout", min=0.2, max=10, help="Seconds to wait per ICMP probe."),
+    only: str | None = typer.Option(None, "--only", help=f"Run only these checks: {','.join(CHECK_IDS)}"),
+    skip: str | None = typer.Option(None, "--skip", help="Skip these checks."),
+    no_scan: bool = typer.Option(False, "--no-scan", help="Skip the common-port scan."),
+    no_rdns: bool = typer.Option(False, "--no-rdns", help="Don't reverse-resolve traceroute hops."),
+    proxy: str | None = typer.Option(None, "--proxy", help="Test through this HTTP proxy (http://host:port)."),
+    no_proxy: bool = typer.Option(False, "--no-proxy", help="Ignore proxy settings and go direct."),
+    quick: bool = typer.Option(False, "--quick", help="Fewer probes: 5 pings, 3 MTR rounds, no port scan."),
+    json_out: str | None = typer.Option(None, "--json", help="Write all evidence as JSON to this file ('-' = stdout)."),
+    brief: bool = typer.Option(False, "--brief", help="Only print the summary table."),
+) -> None:
+    """Diagnose a URL or host bottom-up: local, DNS, ICMP, path, TCP, path MTU, TLS, HTTP."""
+    from .render import render_header, render_result, render_summary
+    from .runner import run_diagnosis
+
+    try:
+        tgt = parse_target(target, port)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="TARGET") from exc
+
+    opts = Options(
+        count=5 if quick else count,
+        max_hops=max_hops,
+        mtr_rounds=3 if quick else rounds,
+        probe_timeout=probe_timeout,
+        scan=not (no_scan or quick),
+        rdns=not no_rdns,
+        proxy=proxy,
+        no_proxy=no_proxy,
+        only=_ids(only, "--only"),
+        skip=_ids(skip, "--skip") or set(),
+    )
+    to_stdout = json_out == "-"
+    console = Console(stderr=to_stdout, highlight=False)
+    quiet = to_stdout
+    if not quiet:
+        from .context import RunContext
+        from .runner import environment
+
+        render_header(console, tgt, environment(RunContext(tgt, opts)))
+    status_line = None if quiet else console.status("Starting…", spinner="dots")
+    if status_line:
+        status_line.start()
+
+    def on_start(module) -> None:
+        if status_line:
+            status_line.update(f"[bold]{module.LAYER}[/] {module.TITLE}…")
+
+    def on_done(result) -> None:
+        if not quiet and not brief:
+            render_result(console, result)
+
+    try:
+        diag = run_diagnosis(tgt, opts, on_start, on_done)
+    finally:
+        if status_line:
+            status_line.stop()
+
+    if not quiet:
+        render_summary(console, diag)
+    if json_out:
+        payload = json.dumps(diag.to_dict(), indent=2, default=str)
+        if to_stdout:
+            sys.stdout.write(payload + "\n")
+        else:
+            out = Path(json_out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(payload, encoding="utf-8")
+            console.print(f"[dim]Evidence written to {json_out}[/]")
+    raise typer.Exit(1 if diag.status == Status.FAIL else 0)
+
+
+@app.command()
+def version() -> None:
+    """Print the version."""
+    typer.echo(f"netdoctor {__version__}")
