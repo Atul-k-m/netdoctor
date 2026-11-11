@@ -60,13 +60,17 @@ def diagnose(
     no_capture: bool = typer.Option(False, "--no-capture", help="Don't capture packets during the run."),
     capture_tool: str = typer.Option("auto", "--capture-tool",
                                      help="auto | dumpcap | pktmon (Windows) | tcpdump (Linux)."),
-    out: Path | None = typer.Option(None, "--out", help="Run folder for capture.pcap (default runs/<time>-<host>)."),
+    out: Path | None = typer.Option(None, "--out",
+                                    help="Run folder for report.md, report.json, capture.pcap (default runs/<time>-<host>)."),
+    no_save: bool = typer.Option(False, "--no-save", help="Write nothing to disk (no report, no capture)."),
 ) -> None:
     """Diagnose a URL or host bottom-up: local, DNS, ICMP, path, TCP, path MTU, TLS, HTTP.
 
-    Packets are captured during the run (needs admin/root; see --no-capture)."""
-    from .render import render_header, render_result, render_summary
+    Ends with a verdict (root cause, confidence, next steps) and writes an incident report.
+    Packets are captured during the run when there are rights to (admin/root; see --no-capture)."""
+    from .render import render_header, render_result, render_summary, render_verdict
     from .runner import run_diagnosis
+    from .verdict import evaluate, write_report
 
     try:
         tgt = parse_target(target, port)
@@ -87,7 +91,7 @@ def diagnose(
         no_proxy=no_proxy,
         only=_ids(only, "--only"),
         skip=_ids(skip, "--skip") or set(),
-        capture=not no_capture,
+        capture=not (no_capture or no_save),
         capture_tool=capture_tool,
         out_dir=run_dir,
     )
@@ -125,10 +129,16 @@ def diagnose(
         if status_line:
             status_line.stop()
 
+    report = diag.to_dict()
+    verdict = evaluate(report)
+    md_path = None
+    if not no_save:
+        md_path, _js = write_report(run_dir, report, verdict)
     if not quiet:
         render_summary(console, diag)
+        render_verdict(console, verdict, str(md_path) if md_path else None)
     if json_out:
-        payload = json.dumps(diag.to_dict(), indent=2, default=str)
+        payload = json.dumps({"verdict": verdict, "diagnosis": report}, indent=2, default=str)
         if to_stdout:
             sys.stdout.write(payload + "\n")
         else:
@@ -167,6 +177,28 @@ def pcap(
         return
     render_result(Console(highlight=False), build_result(summary, {"file": str(file), "tool": "file"}),
                   show_commands=False)
+
+
+@app.command("report")
+def report_cmd(
+    file: Path = typer.Argument(..., exists=True, dir_okay=False,
+                                help="report.json from a run, or the JSON written by --json."),
+    out: Path | None = typer.Option(None, "--out", help="Folder for the new report.md (default: next to FILE)."),
+) -> None:
+    """Re-run the verdict engine on saved evidence and rewrite the incident report."""
+    from .render import render_verdict
+    from .verdict import evaluate, render_markdown
+
+    data = json.loads(file.read_text(encoding="utf-8"))
+    report = data.get("diagnosis", data)
+    if "checks" not in report:
+        raise typer.BadParameter("no NetDoctor evidence in this file", param_hint="FILE")
+    verdict = evaluate(report)
+    target_dir = out or file.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    md = target_dir / "report.md"
+    md.write_text(render_markdown(report, verdict), encoding="utf-8")
+    render_verdict(Console(highlight=False), verdict, str(md))
 
 
 @app.command()

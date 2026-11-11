@@ -79,7 +79,8 @@ def run(ctx: RunContext) -> CheckResult:
                   "mean the host is down: the TCP check is the real test.")
     else:
         loss = st["loss_pct"]
-        if loss >= 5:
+        # One lost echo out of 20 (5%) is common on Wi-Fi and is not a fault on its own.
+        if loss >= 10:
             r.add("icmp.loss", Status.FAIL, f"{loss:.0f}% packet loss to {ip} ({count - st['received']}/{count} lost).")
         elif loss > 0:
             r.add("icmp.loss", Status.WARN, f"{loss:.0f}% packet loss to {ip} ({count - st['received']}/{count} lost).")

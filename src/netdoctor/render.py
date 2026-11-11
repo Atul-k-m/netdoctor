@@ -70,6 +70,35 @@ def render_result(console: Console, r: CheckResult, show_commands: bool = True) 
                         subtitle_align="right", border_style=border, box=box.ROUNDED, padding=(0, 1)))
 
 
+CONF_STYLE = {"High": "bold green", "Medium": "bold yellow", "Low": "bold red"}
+
+
+def render_verdict(console: Console, verdict: dict, report_path: str | None = None) -> None:
+    style = "green" if verdict["root_cause_id"] == "no_fault" else "red" if verdict["confidence"] >= 0.6 else "yellow"
+    parts: list = [
+        Text.assemble(("Root cause  ", "dim"), (verdict["title"], "bold"), ("  " + verdict["root_cause_id"], "dim")),
+        Text.assemble(("Confidence  ", "dim"), (f"{verdict['confidence_label']} ({verdict['confidence']:.2f})",
+                                                 CONF_STYLE.get(verdict["confidence_label"], "")),
+                      ("   Layer ", "dim"), verdict["layer"], ("   Owner ", "dim"), verdict["owner"] or "-"),
+        Text(""),
+        Text(verdict["explanation"]),
+    ]
+    if verdict["resolution"]:
+        parts.append(Text(""))
+        parts.append(Text("Resolution", style="bold"))
+        for i, step in enumerate(verdict["resolution"][:4], 1):
+            parts.append(Text(f"{i}. {step}"))
+    if verdict.get("other_findings"):
+        parts.append(Text(""))
+        parts.append(Text(f"{len(verdict['other_findings'])} other problem(s) not explained by this root cause "
+                          "(see the report).", style="yellow"))
+    if report_path:
+        parts.append(Text(""))
+        parts.append(Text(f"Incident report: {report_path}", style="dim"))
+    console.print(Panel(Group(*parts), title=Text("Verdict", style="bold"), title_align="left", border_style=style,
+                        box=box.HEAVY, padding=(0, 1)))
+
+
 def render_summary(console: Console, diag: Diagnosis) -> None:
     rt = RichTable(title="Summary (bottom-up)", title_justify="left", title_style="bold", box=box.SIMPLE_HEAD)
     rt.add_column("Layer")

@@ -18,7 +18,8 @@ All addresses in the examples come from the documentation ranges (192.0.2.0/24, 
 10. [HTTP and proxies](#10-http-and-proxies)
 11. [IPsec and IKE](#11-ipsec-and-ike)
 12. [Packet capture and the capture summary](#12-packet-capture-and-the-capture-summary)
-13. [Cheat sheet](#13-cheat-sheet)
+13. [The verdict engine and the incident report](#13-the-verdict-engine-and-the-incident-report)
+14. [Cheat sheet](#14-cheat-sheet)
 
 ---
 
@@ -42,7 +43,7 @@ All addresses in the examples come from the documentation ranges (192.0.2.0/24, 
 Order matters for two reasons.
 
 1. **Dependencies.** Each layer depends on the one below. If ARP cannot resolve the gateway, DNS will time out, because the DNS server is off-subnet and every query has to go through the gateway. Someone who starts at DNS will "fix DNS" and get nowhere. Testing bottom-up makes the first failure the most likely root cause, and lets NetDoctor mark higher checks as skipped instead of piling up misleading secondary failures.
-2. **Masking.** A failure at one layer can hide behind a success at another, so no single test is conclusive. ICMP may be blocked while TCP works fine. A proxy may complete the TCP handshake for a server that is actually down. A certificate may validate only because a TLS-inspecting proxy re-signed it. For this reason NetDoctor records evidence from every layer it can reach, and the verdict engine (planned for phase 3) weighs the evidence together rather than trusting one result.
+2. **Masking.** A failure at one layer can hide behind a success at another, so no single test is conclusive. ICMP may be blocked while TCP works fine. A proxy may complete the TCP handshake for a server that is actually down. A certificate may validate only because a TLS-inspecting proxy re-signed it. For this reason NetDoctor records evidence from every layer it can reach, and the verdict engine ([section 13](#13-the-verdict-engine-and-the-incident-report)) weighs the evidence together rather than trusting one result.
 
 Every check records three things: a status, the evidence behind it, and the equivalent manual commands. That way an engineer can paste the results into a ticket and anyone can reproduce them.
 
@@ -1038,7 +1039,61 @@ The decoder handles Ethernet (including 802.1Q/QinQ tags), Linux SLL and SLL2, r
 
 ---
 
-## 13. Cheat sheet
+## 13. The verdict engine and the incident report
+
+Each check reports findings with stable codes such as `dns.nxdomain`, `tcp.filtered`, `pmtu.blackhole` or `tls.expired`. The verdict engine reads those codes, not the prose, and reasons the way an engineer does: find the lowest layer that really fails, check that the evidence above and below fits, and treat everything that follows from the root cause as a consequence rather than a separate problem.
+
+### Rules
+
+The rules live in `src/netdoctor/verdict/rules.py`, about 45 of them, ordered bottom-up. A rule has:
+
+| Field | Meaning |
+|-------|---------|
+| `any_of` / `all_of` / `unless` | Findings that trigger the rule, or rule it out. `tcp.refused:fail` matches only the FAIL form: when a proxy carries the web traffic, a blocked direct connection is reported as INFO, which is expected. |
+| `base` | Starting confidence (0–1) |
+| `support` / `against` | Findings that raise or lower the confidence when present |
+| `explains` | Findings this root cause accounts for (`tls.*` matches a prefix) |
+| `predicate` | An extra condition on facts. Example: a 502 is a proxy problem only if the proxy generated it (an `X-Squid-Error` header, a proxy `Server` header). |
+| text | Symptom, explanation, resolution steps, next steps, owner team, what to send to engineering, Wireshark filters. Templates are filled with facts from the run: `{host}`, `{ip}`, `{cert_not_after}`, `{pmtu}`, `{proxy_auth}`. |
+
+**Choosing the root cause.** Each matching rule's confidence is `base + support − against`, clamped to 0.05–0.99. The highest wins, and on a tie the rule listed first (the lower layer) wins. Confidence of 0.85 or more is labeled High, 0.6 or more Medium, and anything below that Low. If nothing fails, the `no_fault` verdict (0.75) competes with the low-confidence rules: TLS inspection while everything works is reported as an alternative, not blamed. A failure that no rule covers becomes `unclassified` (0.40) and names that failure.
+
+**Consequences vs separate problems.** After the winner is chosen, every FAIL or WARN finding it doesn't explain is listed under *Other observations*, so an independent second problem is never hidden. Examples of explanation:
+
+| Root cause | Explains |
+|------------|----------|
+| `local_dhcp_failed`, `local_gateway_unreachable` | everything above the local host (DNS timeouts, failed connections) |
+| `dns_nxdomain`, `dns_timeout` | every check above DNS. When DNS fails locally but a public resolver answers, NetDoctor keeps testing with that IP, so `tcp.open` then *supports* "DNS is the only problem". |
+| `captive_portal` | the TLS hostname mismatch and certificate errors the portal causes. `tls_hostname_mismatch` carries `unless: http.captive_portal`. |
+| `pmtu_blackhole` | `tls.handshake_timeout`, `http.timeout`, the capture's stalled ClientHello. Without a confirmed black hole, a handshake timeout alone is only a Medium-confidence `tls_handshake_stall`. |
+| `proxy_auth_required` | the TLS check's refused CONNECT, and the INFO-level direct-connection failures |
+
+**Benign once the service answered.** `icmp.no_reply`, `path.stops` and `path.silent` are moved to *Notes* when TCP, TLS or HTTP reached the service. "Ping fails but the site works" is ICMP filtering, not a fault.
+
+**Category.** Each rule has an `id` (specific) and a `category` (coarse), for example `dns_timeout`, `dns_udp53_blocked` and `dns_no_dns` all belong to the category `dns_timeout`. The benchmark (phase 5) scores categories, because the lab can legitimately produce any of the variants depending on whether it has internet access.
+
+### The incident report
+
+Every run writes `runs/<time>-<host>/report.md` and `report.json`. The Markdown follows a knowledge-base article layout, so it can be pasted into a ticket or a KB:
+
+1. **Symptom**: what the user sees (with the browser error code where there is one, e.g. `NET::ERR_CERT_DATE_INVALID`), plus the first failing layer and the layers below it that passed.
+2. **Environment**: client, OS, NetDoctor and ICMP engine, egress interface/IP/gateway/MTU, DNS servers, proxy decision and its source, VPN/security agents, the target and the IP tested.
+3. **Tests run**: one row per check with its result, key finding and time, plus the manual commands that reproduce each one.
+4. **Evidence**: the findings that support the root cause, any that argue against it, the relevant check tables (the DNS comparison, the TCP attempts, the TLS chain, the DF probes…), and the capture summary.
+5. **Root cause**: title, confidence with its breakdown (`base 0.82 +0.10 tcp.port_specific_drop +0.05 icmp.ok`), the explanation, and the other explanations considered, each marked as a consequence where it is one.
+6. **Resolution**: numbered fix steps, then next steps for the support engineer.
+7. **What to send to engineering**: owner team, time (UTC), client and egress, destination, the specific facts (for example "SYNs from 10.20.0.2 to 10.20.0.10:443 get no answer"), evidence lines, attachments (`report.json`, `capture.pcap`) and the Wireshark filters to apply.
+
+`report.json` holds `{"verdict": …, "diagnosis": …}`, the verdict plus all raw evidence. `netdoctor report runs/…/report.json` re-runs the engine on saved evidence and rewrites `report.md`. That is how improved rules get applied to old tickets.
+
+### How it was checked
+
+- `tests/test_verdict.py` feeds synthetic evidence for each of the 12 lab faults. Each must name the right category with High confidence and leave no unexplained findings. The tests also cover the interactions: a local failure explaining DNS and TCP failures, a captive portal suppressing the TLS rule, a black hole beating a handshake stall, a hosts-file entry pointing at the wrong server, clock skew explaining certificate dates, a proxy-generated 502, and a second independent problem staying visible.
+- A live spot check against 13 public endpoints is in the README. That is a spot check; the real benchmark arrives in phase 5.
+
+---
+
+## 14. Cheat sheet
 
 | Symptom | Most likely layer | First test | Typical root cause |
 |---------|-------------------|------------|--------------------|

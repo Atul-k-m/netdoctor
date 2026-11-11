@@ -300,6 +300,9 @@ def _classify_final(ctx: RunContext, r: CheckResult, final: dict, chain: list[di
     page = title_of(final["body"])
     server = _hdr(final, "server")
     origin = f" (Server: {server})" if server else ""
+    r.data["final"] = {"url": final["url"], "status": s, "reason": final["reason"], "server": server,
+                       "generated_by_proxy": proxy_reason, "title": page, "redirects": hops,
+                       "location": final["location"]}
     if 200 <= s < 300:
         r.add("http.ok", Status.PASS, f"HTTP {s} {final['reason']} from {final['url']}{after} in {fmt_ms(final['ms'])}.")
     elif 300 <= s < 400:

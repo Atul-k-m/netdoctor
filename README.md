@@ -1,8 +1,9 @@
 # NetDoctor
 
 NetDoctor works a "this site doesn't load" ticket the way a technical support engineer does. It takes a failing URL or
-host, tests it layer by layer from the local machine up to HTTP, and records the evidence for every result, along with
-the manual commands that reproduce it.
+host and tests it layer by layer from the local machine up to HTTP. It records the evidence for every result, along
+with the manual commands that reproduce it, then names the root cause with a confidence and the next step, and writes
+the ticket notes as a knowledge-base style incident report.
 
 ```
 netdoctor diagnose https://app.example.com/login
@@ -12,8 +13,8 @@ Runs on Windows and Linux with Python 3.10+. The checks need no administrator or
 Windows `IcmpSendEcho` API, or unprivileged ICMP sockets on Linux. Packet capture is the one exception. It needs an
 elevated terminal or root, and without one it is skipped with the reason.
 
-> **Status:** phases 1–2 of 7 are done (the diagnostic CLI and packet capture). The verdict engine, Docker fault lab,
-> benchmark and IPsec tunnel check are still to come. See [Roadmap](#roadmap).
+> **Status:** phases 1–3 of 7 are done (the diagnostic CLI, packet capture and the verdict engine). The Docker fault
+> lab, benchmark and IPsec tunnel check are still to come. See [Roadmap](#roadmap).
 
 ## What it checks
 
@@ -73,11 +74,26 @@ netdoctor diagnose TARGET [options]
   --brief              summary table only
   --no-capture         don't capture packets
   --capture-tool T     auto | dumpcap | pktmon (Windows) | tcpdump (Linux)
-  --out DIR            run folder for capture.pcap (default runs/<time>-<host>)
+  --out DIR            run folder for report.md, report.json, capture.pcap (default runs/<time>-<host>)
+  --no-save            write nothing to disk
 
 netdoctor pcap FILE [--focus ip:port]... [--json]
                        summarize any .pcap/.pcapng, e.g. one a customer sent
+netdoctor report runs/<run>/report.json
+                       re-run the verdict engine on saved evidence and rewrite report.md
 ```
+
+### Verdict and incident report
+
+After the checks, the verdict engine maps the findings to a **root cause**, a **confidence** (High/Medium/Low with
+the score breakdown) and an **owner team**. Lower-layer causes explain higher-layer symptoms: a captive portal
+explains the TLS hostname mismatch it causes, and an MTU black hole explains the stalled TLS handshake. Anything left
+unexplained is listed separately, so a second problem isn't hidden. The rules are listed in
+[docs/how-it-works.md §13](docs/how-it-works.md#13-the-verdict-engine-and-the-incident-report).
+
+`report.md` is a knowledge-base article with the sections **Symptom, Environment, Tests run, Evidence, Root cause,
+Resolution, What to send to engineering** (plus Other observations and Notes). `report.json` holds the verdict and
+all raw evidence.
 
 ### Packet capture
 
@@ -136,25 +152,50 @@ Summary (bottom-up)
   L7 HTTP     http     INFO    HTTP 200 OK from https://expired.badssl.com/ in 1105 ms.
 ```
 
-These public test endpoints were run during development, and each one produced the intended finding:
+The run ends with the verdict, and the run folder holds the full incident report. This one is from
+`netdoctor diagnose https://expired.badssl.com --quick --no-capture --out runs\sample-expired`, abridged:
 
-| Target | Finding |
-|--------|---------|
-| `expired.badssl.com` | `tls.expired` |
-| `wrong.host.badssl.com` | `tls.hostname_mismatch` |
-| `self-signed.badssl.com` | `tls.self_signed` |
-| `untrusted-root.badssl.com` | `tls.untrusted` |
-| `incomplete-chain.badssl.com` | `tls.incomplete_chain` |
-| `sha1-intermediate.badssl.com` | `tls.weak_crypto` (+ expired) |
-| `https://tls-v1-0.badssl.com:1010` | `tls.old_protocol` |
-| `example.com:81` | `tcp.filtered` |
-| `127.0.0.1:1` | `tcp.refused` |
-| `nothing-here-netdoctor.example` | `dns.nxdomain` |
-| `dnssec-failed.org` | `dns.dnssec_failure` |
-| `http://httpbin.org/status/502` | `http.bad_gateway` |
+```text
+┏━ Verdict ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Root cause  The server's TLS certificate has expired  tls_expired           ┃
+┃ Confidence  High (0.93)   Layer L5-L6 TLS   Owner Site / application owner  ┃
+┃                                                                             ┃
+┃ The certificate presented for expired.badssl.com (*.badssl.com, issued by   ┃
+┃ COMODO RSA Domain Validation Secure Server CA) expired on 2015-04-12. DNS,  ┃
+┃ routing and TCP to 104.154.89.105:443 work; every client that validates     ┃
+┃ certificates rejects the server.                                            ┃
+┃ Resolution                                                                  ┃
+┃ 1. Renew the certificate and install it (with its chain) on every           ┃
+┃    server/load balancer for expired.badssl.com.                             ┃
+┃ ...                                                                         ┃
+┃ Incident report: runs\sample-expired\report.md                              ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
 
-That table is a spot check, not the benchmark. The benchmark, which scores root-cause accuracy over injected faults,
-arrives in phase 5.
+### Verdict spot check on public endpoints (measured)
+
+These are public endpoints with known faults, run with `--quick --no-capture` from a home Windows 11 connection on
+2026-11-11. The script compares the verdict's category with the fault each endpoint is meant to show:
+
+| Target | Intended fault | Verdict (rule, confidence) |
+|--------|----------------|----------------------------|
+| `https://example.com` | none | `no_fault` (0.75) |
+| `expired.badssl.com` | expired certificate | `tls_expired` (0.93) |
+| `wrong.host.badssl.com` | hostname mismatch | `tls_hostname_mismatch` (0.90) |
+| `self-signed.badssl.com` | self-signed | `tls_self_signed` (0.88) |
+| `untrusted-root.badssl.com` | untrusted CA | `tls_untrusted` (0.90) |
+| `incomplete-chain.badssl.com` | missing intermediate | `tls_incomplete_chain` (0.90) |
+| `sha1-intermediate.badssl.com` | SHA-1 intermediate | `tls_expired` (0.93), with SHA-1 listed as a second problem |
+| `https://tls-v1-0.badssl.com:1010` | TLS 1.0 only | `tls_old_protocol` (0.88) |
+| `example.com:81` | filtered port | `tcp_filtered` (0.90) |
+| `127.0.0.1:1` | refused port | `tcp_refused` (0.94) |
+| `nothing-here-netdoctor.example` | NXDOMAIN | `dns_nxdomain` (0.93) |
+| `dnssec-failed.org` | DNSSEC failure | `dns_dnssec` (0.90) |
+| `http://httpbin.org/status/502` | upstream 502 | `http_upstream_error` (0.90) |
+
+**12 of 13** named the intended fault. The miss isn't wrong: `sha1-intermediate.badssl.com`'s leaf certificate also
+expired, on 2020-05-30, so the engine ranks "expired" first and reports the SHA-1 chain under *Other observations*.
+This is a spot check. The benchmark, which scores root-cause accuracy over injected faults, arrives in phase 5.
 
 ## Tests
 
@@ -173,6 +214,10 @@ NXDOMAIN and unanswered queries, ICMP frag-needed). They run them through the pc
 byte orders, nanosecond timestamps, Linux SLL2 and VLAN tags. When tshark is on PATH, `tests/test_tshark_crosscheck.py`
 also checks that the analyzer's counts match Wireshark's `tcp.analysis.*` flags on the same file.
 
+The verdict tests feed synthetic evidence for each of the 12 lab faults (each must name the right category with High
+confidence and leave nothing unexplained), plus the interactions between findings and a check that every report has
+all seven KB sections.
+
 CI runs the suite on Windows and Ubuntu (Python 3.10, 3.12, 3.13). On Linux it also exercises the real ICMP
 datagram-socket engine and the tshark cross-check.
 
@@ -180,7 +225,7 @@ datagram-socket engine and the tshark cross-check.
 
 - [x] **1. Diagnostic CLI:** the eight bottom-up checks with evidence
 - [x] **2. Packet capture** during each run (.pcap) with a summary of handshakes, retransmissions, RSTs, zero windows, TLS alerts and DNS errors
-- [ ] **3. Verdict engine:** rules that map evidence to a root cause, a confidence and the next step; a Markdown knowledge-base incident report plus JSON
+- [x] **3. Verdict engine:** rules that map evidence to a root cause, a confidence and the next step; a Markdown knowledge-base incident report plus JSON
 - [ ] **4. Fault lab:** Docker Compose with 12 reproducible customer faults, one command to inject and one to clear each
 - [ ] **5. Benchmark:** inject each fault, run NetDoctor, score the root cause (results go in this README)
 - [ ] **6. `netdoctor tunnel`:** IKE SA state, traffic through the tunnel, MSS/MTU hints
